@@ -3,13 +3,15 @@ package main
 import (
 	"encoding/json"
 	"fmt"
+	"github.com/ethereum/go-ethereum/common"
+
+	_ "github.com/ethereum/go-ethereum/ethclient"
 	"github.com/joho/godotenv"
 	"io/ioutil"
 	"log"
 	"math/big"
 	"net/http"
 	"os"
-	"strings"
 )
 
 type TransactionData struct {
@@ -26,6 +28,16 @@ type TransactionData struct {
 	Input            string `json:"input"`
 }
 
+type TransactionReceipt struct {
+	Result struct {
+		GasUsed string `json:"gasUsed"`
+	} `json:"result"`
+}
+
+var erc20ABI = `[{"constant":false,"inputs":[{"name":"recipient","type":"address"},
+	{"name":"amount","type":"uint256"}],"name":"transfer","outputs":
+	[{"name":"","type":"bool"}],"payable":false,"stateMutability":"nonpayable","type":"function"}]`
+
 func main() {
 	err := godotenv.Load()
 	if err != nil {
@@ -33,6 +45,10 @@ func main() {
 	}
 
 	txHash := "0x783e170e1dda8c8a7b2a88026b5a68686f80ffccff6f5d029ef9f70166a4c27c"
+
+	if err != nil {
+		log.Fatalf("Error connecting to the Ethereum client: %v", err)
+	}
 
 	url := fmt.Sprintf("https://api-sepolia.etherscan.io/api?module=proxy&action="+
 		"eth_getTransactionByHash&txhash=%s&apikey=%s", txHash, os.Getenv("API_KEY"))
@@ -72,11 +88,60 @@ func main() {
 
 	log.Printf("Nonce: %s\n", hexToDecimal(tx.Nonce))
 	log.Printf("Transaction Index: %s\n", hexToDecimal(tx.TransactionIndex))
-	log.Printf("Input Data: %s\n", tx.Input)
+
+	// GETTING TX  FEES
+	receiptUrl := fmt.Sprintf("https://api-sepolia.etherscan.io/api?module=proxy&action="+
+		"eth_getTransactionReceipt&txhash=%s&apikey=%s", txHash, os.Getenv("API_KEY"))
+
+	receiptResp, err := http.Get(receiptUrl)
+	if err != nil {
+		log.Fatalf("Error fetching transaction receipt: %v", err)
+	}
+	defer receiptResp.Body.Close()
+
+	receiptBody, err := ioutil.ReadAll(receiptResp.Body)
+	if err != nil {
+		log.Fatalf("Error reading receipt response body: %v", err)
+	}
+
+	var receiptResponse TransactionReceipt
+	err = json.Unmarshal(receiptBody, &receiptResponse)
+	if err != nil {
+		log.Fatalf("Error unmarshalling receipt: %v", err)
+	}
+
+	gasUsed := hexToDecimal(receiptResponse.Result.GasUsed)
+
+	feesWei := new(big.Int).Mul(gasUsed, gasPriceWei)
+
+	// CONVERT TO ETH
+	commissionETH := new(big.Float).Quo(new(big.Float).SetInt(feesWei), big.NewFloat(1e18))
+
+	log.Printf("Transaction Fee (in ETH): %s\n", commissionETH.Text('f', 18))
+
+	log.Printf("Input Data (Raw): %s\n", tx.Input)
+
+	inputData := tx.Input
+	if len(inputData) > 10 { // 10 BECAUSE FIRST 10 SYMBOLS IS FUNC SIGNATURE
+		data := inputData[10:]
+
+		addressBytes := common.Hex2Bytes(data[:64]) // RECIPTER ADRESS
+		amountBytes := common.Hex2Bytes(data[64:])  // TOKEN AMOUNT
+
+		var recipientAddress common.Address
+		copy(recipientAddress[:], addressBytes[12:32])
+
+		amount := new(big.Int)
+		amount.SetBytes(amountBytes)
+
+		log.Printf("Decoded Input Data:\n")
+		log.Printf("Recipient Address: %s\n", recipientAddress.Hex())
+		log.Printf("Amount: %s\n", amount.String())
+	}
 }
 
-func hexToDecimal(hexValue string) *big.Int {
-	decimalValue := new(big.Int)
-	decimalValue.SetString(strings.TrimPrefix(hexValue, "0x"), 16)
-	return decimalValue
+func hexToDecimal(hexStr string) *big.Int {
+	value := new(big.Int)
+	value.SetString(hexStr[2:], 16)
+	return value
 }
